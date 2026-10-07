@@ -239,6 +239,17 @@ Paths are resolved before the check, so `..` segments and symlinks cannot escape
 
 The download URL itself must be an `https` URL on `<subdomain>.zendesk.com` for your configured subdomain; the tool refuses anything else so the OAuth token is never sent to another host. Archives are limited to 10,000 entries and 256 MiB unpacked, and tar members that are not regular files or directories are skipped.
 
+## Rate limits
+
+Zendesk limits API requests per minute for the whole account (200 on Team up to 2,500 on
+Enterprise Plus), and every integration shares it. When Zendesk answers 429, the server waits
+for the `Retry-After` it gives, for at most `rate_limit_budget_seconds` (default 20) per tool
+call, and then returns a "rate limiting this account" message instead of blocking. Set the
+budget in the config file or with `ZENDESK_MCP_RATELIMIT_BUDGET_SECONDS`; `0` never waits.
+
+Tools also avoid one-request-per-record lookups: a search of 50 tickets makes 2 API calls
+(one search, one batched user lookup), not 56.
+
 ## Development
 
 ```bash

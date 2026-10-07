@@ -18,11 +18,13 @@ import os
 import re
 import time
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
+from zenpy.lib.exception import RatelimitBudgetExceeded
 
-from zendesk_mcp.config import config_path, load_config, save_config
+from zendesk_mcp.config import config_path, load_config, rate_limit_budget, save_config
 
 try:
     import fcntl
@@ -35,6 +37,14 @@ REFRESH_SKEW_SECONDS = 120
 REFRESH_TIMEOUT_SECONDS = 30
 
 REAUTH_HINT = "Re-run: zendesk-mcp setup"
+
+# 429 handling for the direct HTTP calls (Zenpy has its own, bounded by ratelimit_budget).
+MAX_RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_MESSAGE = (
+    "Zendesk is rate limiting this account (HTTP 429), and the request was still being "
+    "throttled after waiting. Other integrations share the same API limit. Wait a minute "
+    "and try again."
+)
 
 
 class TokenExpiredError(Exception):
@@ -178,6 +188,41 @@ def valid_token(
     return cfg.get("subdomain", "").strip(), cfg["oauth_token"].strip()
 
 
+def _retry_after_seconds(response: httpx.Response, attempt: int) -> int:
+    """Seconds Zendesk asked us to wait, or an exponential backoff if it did not say."""
+    raw = response.headers.get("Retry-After", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            try:
+                delta = parsedate_to_datetime(raw).timestamp() - time.time()
+                return max(1, int(delta))
+            except (TypeError, ValueError):
+                pass
+    return 2 ** attempt
+
+
+def _send(method: str, url: str, headers: dict, budget: list, **kwargs) -> httpx.Response:
+    """httpx.request that waits out 429 responses, within ``budget`` seconds in total.
+
+    ``budget`` is a one-element list so the wait budget is shared with the caller's other
+    attempts. A 429 means the request was not processed, so retrying is safe for any method.
+    If the wait Zendesk asked for does not fit in what is left, the 429 is returned as is.
+    """
+    attempt = 0
+    while True:
+        response = httpx.request(method, url, headers=headers, **kwargs)
+        if response.status_code != 429 or attempt >= MAX_RATE_LIMIT_RETRIES:
+            return response
+        wait = _retry_after_seconds(response, attempt)
+        if wait > budget[0]:
+            return response
+        budget[0] -= wait
+        time.sleep(wait)
+        attempt += 1
+
+
 def request(
     method: str,
     url: str,
@@ -188,12 +233,14 @@ def request(
     """httpx.request with the bearer token injected, refreshing once on a 401.
 
     Pre-emptive expiry checking covers the normal case; this also handles a token
-    revoked server-side or a clock skew that made it look valid.
+    revoked server-side or a clock skew that made it look valid. 429 responses are waited
+    out within the rate-limit budget (see config.rate_limit_budget).
     """
     kwargs.setdefault("timeout", 30)
     _, token = valid_token(config_file, now)
     headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {token}"}
-    response = httpx.request(method, url, headers=headers, **kwargs)
+    budget = [rate_limit_budget()]
+    response = _send(method, url, headers, budget, **kwargs)
 
     if response.status_code != 401:
         return response
@@ -204,7 +251,7 @@ def request(
 
     cfg = _renewed_credentials(token, config_file, now, fallback=cfg)
     headers["Authorization"] = f"Bearer {cfg['oauth_token']}"
-    response = httpx.request(method, url, headers=headers, **kwargs)
+    response = _send(method, url, headers, budget, **kwargs)
     if response.status_code == 401:
         raise TokenExpiredError(_expired_message("still rejected after refresh"))
     return response
@@ -233,6 +280,16 @@ def is_auth_error(exc: Exception) -> bool:
     return re.search(r"(?<!\d)401(?!\d)", text) is not None
 
 
+def is_rate_limited(exc: Exception) -> bool:
+    """True if an exception from a Zendesk call means the API throttled us (HTTP 429)."""
+    if isinstance(exc, RatelimitBudgetExceeded):
+        return True
+    if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+        return True
+    text = str(exc).lower()
+    return "too many requests" in text or "rate limit" in text or "ratelimit" in text
+
+
 def api_error_message(exc: Exception) -> str:
     """Render an exception from a Zendesk call as a message for the caller.
 
@@ -240,6 +297,8 @@ def api_error_message(exc: Exception) -> str:
     """
     if isinstance(exc, TokenExpiredError):
         return str(exc)
+    if is_rate_limited(exc):
+        return RATE_LIMIT_MESSAGE
     if is_auth_error(exc):
         return _expired_message()
     return f"Zendesk API error: {exc}"

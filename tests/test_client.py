@@ -31,7 +31,9 @@ def test_get_client_returns_zenpy_instance(tmp_path):
         mock_zenpy.return_value = mock_instance
         from zendesk_mcp.client import get_client
         result = get_client(cfg_file)
-        mock_zenpy.assert_called_once_with(subdomain="example", oauth_token="tok123")
+        mock_zenpy.assert_called_once_with(
+            subdomain="example", oauth_token="tok123", ratelimit_budget=20
+        )
         assert result is mock_instance
 
 
