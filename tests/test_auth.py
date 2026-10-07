@@ -1,4 +1,9 @@
 import json
+import subprocess
+import sys
+import textwrap
+import threading
+import time
 from unittest.mock import patch
 
 import httpx
@@ -283,3 +288,98 @@ def test_request_injects_bearer_token(mock_request, tmp_path):
     auth.request("GET", "https://acme.zendesk.com/x", config_file=cfg, now=NOW)
 
     assert mock_request.call_args.kwargs["headers"]["Authorization"] == "Bearer old-tok"
+
+
+# --- cross-process refresh lock --------------------------------------------
+
+
+def test_refresh_lock_file_sits_next_to_the_config(tmp_path):
+    cfg = write_config(tmp_path)
+    with auth._refresh_lock(cfg):
+        assert (tmp_path / "config.json.lock").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl locking is POSIX only")
+def test_refresh_lock_blocks_another_process_until_released(tmp_path):
+    cfg = write_config(tmp_path)
+    holder = subprocess.Popen(
+        [sys.executable, "-I", "-c", textwrap.dedent(f"""
+            import fcntl, os, sys, time
+            fd = os.open({str(tmp_path / "config.json.lock")!r}, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            print("locked", flush=True)
+            time.sleep(0.8)
+        """)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        started = time.monotonic()
+        with auth._refresh_lock(cfg):
+            waited = time.monotonic() - started
+    finally:
+        holder.wait(timeout=10)
+    assert waited >= 0.4
+
+
+@patch("zendesk_mcp.auth.httpx.post")
+def test_concurrent_refreshes_redeem_the_refresh_token_only_once(mock_post, tmp_path):
+    """Several MCP server processes see the same expired token at once; only one may refresh."""
+    cfg = write_config(tmp_path, refresh_token="r1", expires_at=NOW - 10, client_id="cid")
+    stale = json.loads(cfg.read_text())
+    calls = []
+
+    def slow_refresh(*_args, **_kwargs):
+        calls.append(1)
+        time.sleep(0.2)  # long enough for the other callers to queue on the lock
+        return token_response(access=f"tok-{len(calls)}", refresh=f"refresh-{len(calls)}", expires_in=86400)
+
+    mock_post.side_effect = slow_refresh
+    results, errors = [], []
+
+    def worker():
+        try:
+            # Every caller holds the same pre-refresh snapshot, like separate processes would.
+            results.append(auth.valid_token(cfg, now=NOW, cfg_snapshot=dict(stale)))
+        except Exception as e:  # pragma: no cover - failure path
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=30)
+
+    assert errors == []
+    assert len(calls) == 1
+    assert {token for _, token in results} == {"tok-1"}
+    assert json.loads(cfg.read_text())["refresh_token"] == "refresh-1"
+
+
+@patch("zendesk_mcp.auth.httpx.request")
+@patch("zendesk_mcp.auth.httpx.post")
+def test_request_401_uses_credentials_another_process_just_stored(mock_post, mock_request, tmp_path):
+    """A 401 must not redeem the refresh token if another process already replaced the access token."""
+    cfg = write_config(
+        tmp_path, refresh_token="r1", expires_at=NOW + 100_000, client_id="cid", client_secret="s"
+    )
+    ok = httpx.Response(200, json={}, request=httpx.Request("GET", "https://acme.zendesk.com/x"))
+    unauthorized = httpx.Response(
+        401, json=EXPIRED_401, request=httpx.Request("GET", "https://acme.zendesk.com/x")
+    )
+
+    def first_call_loses_the_race(*_args, **_kwargs):
+        if mock_request.call_count == 1:
+            stored = json.loads(cfg.read_text())
+            cfg.write_text(json.dumps({**stored, "oauth_token": "other-process-tok", "refresh_token": "r2"}))
+            return unauthorized
+        return ok
+
+    mock_request.side_effect = first_call_loses_the_race
+
+    response = auth.request("GET", "https://acme.zendesk.com/x", config_file=cfg, now=NOW)
+
+    assert response.status_code == 200
+    mock_post.assert_not_called()
+    assert mock_request.call_args_list[1].kwargs["headers"]["Authorization"] == "Bearer other-process-tok"

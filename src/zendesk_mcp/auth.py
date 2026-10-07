@@ -7,15 +7,27 @@ to keep working, so a config without ``expires_at`` is treated as non-expiring a
 never refreshed.
 
 Refreshing rotates the refresh token and invalidates the previous pair, so the new
-credentials must be persisted on every refresh.
+credentials must be persisted on every refresh. Several server processes (one per MCP
+client session) share one config file, so a refresh runs under an exclusive file lock and
+re-reads the file once it holds it: a process that waited uses the credentials the first one
+stored instead of redeeming the refresh token a second time, which would be rejected and
+force the user to re-run setup. The lock needs ``fcntl``, so on Windows only the re-read
+protects against the race.
 """
+import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
 
-from zendesk_mcp.config import load_config, save_config
+from zendesk_mcp.config import config_path, load_config, save_config
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
 
 # Refresh slightly ahead of the deadline so a request already in flight does not
 # land on a token that expired in transit.
@@ -106,6 +118,43 @@ def refresh_access_token(
     return updated
 
 
+@contextmanager
+def _refresh_lock(config_file: Path | None = None):
+    """Exclusive cross-process lock held while redeeming a refresh token."""
+    if fcntl is None:  # pragma: no cover - Windows
+        yield
+        return
+    target = config_file or config_path()
+    lock_path = target.with_name(target.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
+
+
+def _renewed_credentials(
+    used_token: str,
+    config_file: Path | None,
+    now: float | None,
+    fallback: dict | None = None,
+) -> dict:
+    """Return credentials that replace ``used_token``, refreshing at most once across processes.
+
+    ``used_token`` is the access token the caller found unusable. If the file now holds a
+    different, unexpired token, another process already refreshed while we waited for the
+    lock, and redeeming the refresh token again would invalidate that fresh pair.
+    """
+    with _refresh_lock(config_file):
+        on_disk = load_config(config_file)
+        current = (on_disk.get("oauth_token") or "").strip()
+        if current and current != used_token and not is_expired(on_disk, now):
+            return on_disk
+        return refresh_access_token(on_disk or fallback or {}, config_file, now)
+
+
 def valid_token(
     config_file: Path | None = None,
     now: float | None = None,
@@ -125,13 +174,7 @@ def valid_token(
     if not is_expired(cfg, now):
         return subdomain, token
 
-    # Another process sharing this config file may have refreshed already; prefer
-    # its result over burning our (now possibly stale) refresh token.
-    on_disk = load_config(config_file)
-    if on_disk.get("oauth_token") and not is_expired(on_disk, now):
-        return on_disk.get("subdomain", "").strip(), on_disk["oauth_token"].strip()
-
-    cfg = refresh_access_token(on_disk or cfg, config_file, now)
+    cfg = _renewed_credentials(token, config_file, now, fallback=cfg)
     return cfg.get("subdomain", "").strip(), cfg["oauth_token"].strip()
 
 
@@ -159,7 +202,7 @@ def request(
     if not can_refresh(cfg):
         raise TokenExpiredError(_expired_message("server rejected the token"))
 
-    cfg = refresh_access_token(cfg, config_file, now)
+    cfg = _renewed_credentials(token, config_file, now, fallback=cfg)
     headers["Authorization"] = f"Bearer {cfg['oauth_token']}"
     response = httpx.request(method, url, headers=headers, **kwargs)
     if response.status_code == 401:
