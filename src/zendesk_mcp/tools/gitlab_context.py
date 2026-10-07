@@ -1,6 +1,7 @@
 from zendesk_mcp.client import get_client, ConfigError
 from zendesk_mcp.config import load_config
 from zendesk_mcp.auth import api_error_message, TokenExpiredError
+from zendesk_mcp.lookup import prefetch_users
 
 
 def _get_gitlab_context(ticket_id: int) -> str:
@@ -8,6 +9,7 @@ def _get_gitlab_context(ticket_id: int) -> str:
         client = get_client()
         ticket = client.tickets(id=ticket_id)
         comments = list(client.tickets.comments(ticket_id))
+        prefetch_users(client, [ticket.requester_id] + [c.author_id for c in comments])
 
         subdomain = load_config().get("subdomain", "")
         ticket_url = f"https://{subdomain}.zendesk.com/agent/tickets/{ticket_id}"

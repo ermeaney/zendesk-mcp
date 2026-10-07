@@ -1,6 +1,7 @@
 import json
 from zendesk_mcp.client import get_client, ConfigError
 from zendesk_mcp.auth import api_error_message, TokenExpiredError
+from zendesk_mcp.lookup import prefetch_users
 
 
 def _search_tickets_data(keywords: str | None, status: str | None, limit: int) -> str:
@@ -12,10 +13,16 @@ def _search_tickets_data(keywords: str | None, status: str | None, limit: int) -
         if status:
             query += f" status:{status}"
         results = client.search(query=query, sort_by="created_at", sort_order="desc")
-        tickets = []
+        found = []
         for ticket in results:
-            if len(tickets) >= limit:
+            if len(found) >= limit:
                 break
+            found.append(ticket)
+        prefetch_users(client, [
+            uid for t in found for uid in (t.requester_id, t.assignee_id)
+        ])
+        tickets = []
+        for ticket in found:
             tickets.append({
                 "id": ticket.id,
                 "subject": ticket.subject,
@@ -44,6 +51,7 @@ def _get_ticket_data(ticket_id: int) -> str:
     try:
         client = get_client()
         ticket = client.tickets(id=ticket_id)
+        prefetch_users(client, [ticket.requester_id, ticket.assignee_id])
         return json.dumps({
             "id": ticket.id,
             "subject": ticket.subject,

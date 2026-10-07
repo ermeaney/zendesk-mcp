@@ -1,12 +1,14 @@
 import json
 from zendesk_mcp.client import get_client, ConfigError
 from zendesk_mcp.auth import api_error_message, TokenExpiredError
+from zendesk_mcp.lookup import prefetch_users
 
 
 def _get_comments_data(ticket_id: int) -> str:
     try:
         client = get_client()
-        comments = client.tickets.comments(ticket_id)
+        comments = list(client.tickets.comments(ticket_id))
+        prefetch_users(client, [c.author_id for c in comments])
         result = []
         for comment in comments:
             try:
